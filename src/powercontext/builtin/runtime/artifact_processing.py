@@ -110,6 +110,7 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    source_count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -392,6 +393,7 @@ class _FamilyState:
     running: dict[str, _RunningWorker] = field(default_factory=dict)
     retries: dict[str, _RetryState] = field(default_factory=dict)
     requested_after: int = 0
+    count_after: int = 0
     scan_after: int = 0
     scan_generation: int = 0
     scan_in_progress: bool = False
@@ -648,6 +650,7 @@ class ArtifactProcessingSupervisor:
                 state.next_discovery_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
         else:
             state.reconcile_complete = True
+        await self._discover_count(state)
         # Alternate discovery channels so explicit traffic cannot monopolize admission.
         state.automatic_next = not state.automatic_next
         if state.automatic_next:
@@ -656,6 +659,46 @@ class ArtifactProcessingSupervisor:
         else:
             await self._discover_requested(state)
             await self._discover_automatic(state)
+
+    async def _discover_count(self, state: _FamilyState) -> None:
+        threshold = state.binding.source_count_threshold
+        if threshold is None or self._fresh_capacity(state) <= 0:
+            return
+        from powercontext.builtin.persistence.cursors import SourceCursorRepository
+        from powercontext.builtin.persistence.tables import SOURCE_JOURNAL_HEADS_TABLE
+
+        capacity = self._fresh_capacity(state)
+        admitted: list[str] = []
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            rows = await self._intents.scan(
+                connection,
+                state.binding.binding_name,
+                after_sequence=state.count_after,
+                limit=_DISCOVERY_PAGE_SIZE,
+                dirty_only=True,
+            )
+            for row in rows:
+                state.count_after = row.pending_sequence
+                if row.scope_id in state.queued or row.scope_id in state.running or row.scope_id in state.retries:
+                    continue
+                if row.requested_generation > row.handled_generation:
+                    continue
+                cursor = await SourceCursorRepository().load(connection, row.scope_id, state.binding.binding_name)
+                high = await connection.scalar(
+                    select(SOURCE_JOURNAL_HEADS_TABLE.c.position).where(
+                        SOURCE_JOURNAL_HEADS_TABLE.c.scope_id == row.scope_id
+                    )
+                )
+                if int(high or 0) - (cursor.cursor.sequence if cursor is not None else 0) >= threshold:
+                    await self._intents.request(connection, row.scope_id, state.binding.binding_name)
+                    admitted.append(row.scope_id)
+                    if len(admitted) >= capacity:
+                        break
+            if len(rows) < _DISCOVERY_PAGE_SIZE:
+                state.count_after = 0
+        for scope in admitted:
+            self._enqueue(state, scope)
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
@@ -1083,6 +1126,8 @@ class ArtifactProcessingSupervisor:
         for state in self._families.values():
             if len(state.running) >= state.binding.max_workers:
                 continue
+            if state.binding.source_count_threshold is not None:
+                deadlines.append(now + self._tick)
             deadlines.extend(
                 retry.deadline
                 for scope, retry in state.retries.items()

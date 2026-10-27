@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +108,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedEvidenceFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,14 @@ class MemoryEntryAddress:
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class PreparedEvidenceFragment:
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -160,6 +171,38 @@ class PreparedContextBuilder:
 
     def empty(self) -> PreparedContext:
         return PreparedContext(status="empty", content=None, content_bytes=0)
+
+    def _select_evidence(
+        self, request: PrepareContextRequest, groups: Sequence[PreparedMemoryCandidates]
+    ) -> PreparedContextBuild:
+        selected: list[PreparedEvidenceFragment] = []
+        for _, fragment in _evidence_candidates(request.query, groups):
+            if any(
+                item.address == fragment.address and item.start < fragment.end and fragment.start < item.end
+                for item in selected
+            ):
+                continue
+            rendered = _render_fragments((*selected, fragment))
+            if len(rendered.encode("utf-8")) <= request.max_bytes:
+                selected.append(fragment)
+                continue
+            lower, upper = 0, len(fragment.text)
+            while lower < upper:
+                middle = (lower + upper + 1) // 2
+                shortened = replace(fragment, end=fragment.start + middle, text=fragment.text[:middle])
+                if len(_render_fragments((*selected, shortened)).encode("utf-8")) <= request.max_bytes:
+                    lower = middle
+                else:
+                    upper = middle - 1
+            if lower >= 32:
+                selected.append(replace(fragment, end=fragment.start + lower, text=fragment.text[:lower]))
+        if not selected:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = _render_fragments(selected)
+        context = PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8")))
+        return PreparedContextBuild(
+            context=context, origins=tuple(item.address for item in selected), fragments=tuple(selected)
+        )
 
     def build(
         self,
@@ -211,6 +254,8 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            return self._select_evidence(request, memory_candidates)
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -691,6 +736,54 @@ def _render(entries: Sequence[_PreparedContextEntry]) -> str:
         "items": [_render_entry(entry) for entry in entries],
     }
     encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _evidence_candidates(
+    query_text: str, groups: Sequence[PreparedMemoryCandidates]
+) -> list[tuple[float, PreparedEvidenceFragment]]:
+    query = set(re.findall(r"\w+", query_text.lower()))
+    candidates: list[tuple[float, PreparedEvidenceFragment]] = []
+    frequencies = Counter(
+        term for group in groups for hit in group.hits for term in set(re.findall(r"\w+", hit.text.lower()))
+    )
+    for group in groups:
+        for hit in group.hits:
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            spans = [
+                (match.start(), match.end()) for match in re.finditer(r".+?(?:[.!?](?=\s|$)|\n|$)", hit.text, re.S)
+            ]
+            for index, (start, _) in enumerate(spans):
+                for width in range(1, min(3, len(spans) - index) + 1):
+                    end = spans[index + width - 1][1]
+                    text = hit.text[start:end]
+                    terms = set(re.findall(r"\w+", text.lower()))
+                    score = sum(1 / frequencies[term] for term in terms & query) / max(1, len(terms)) ** 0.35
+                    if score:
+                        candidates.append((score, PreparedEvidenceFragment(address, start, end, text)))
+    return sorted(candidates, key=lambda item: -item[0])
+
+
+def _render_fragments(fragments: Sequence[PreparedEvidenceFragment]) -> str:
+    items = [
+        {
+            "citation": {
+                "scope_id": item.address.memory.scope_id,
+                "memory_ref": item.address.memory.artifact.model_dump(mode="json"),
+                "entry_id": item.address.entry_id,
+                "entry_version_id": item.address.entry_version_id,
+            },
+            "content": item.text,
+            "start": item.start,
+            "end": item.end,
+        }
+        for item in fragments
+    ]
+    encoded = json.dumps({"trust": "untrusted_history", "items": items}, ensure_ascii=False, separators=(",", ":"))
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 

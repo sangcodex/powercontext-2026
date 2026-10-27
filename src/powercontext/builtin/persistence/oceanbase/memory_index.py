@@ -31,6 +31,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.mysql import match
 from sqlalchemy.ext.asyncio import AsyncConnection
+from typing_extensions import override
 
 from powercontext.artifacts import ArtifactRef
 from powercontext.builtin.artifacts.memory import (
@@ -42,7 +43,7 @@ from powercontext.builtin.artifacts.memory import (
     MemorySearchRequest,
 )
 from powercontext.builtin.artifacts.memory.canonical import embedding_content_hash, validate_embedding
-from powercontext.builtin.persistence.memory_index import memory_channel_hits
+from powercontext.builtin.persistence.memory_index import CompositeMemoryIndex, memory_channel_hits
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
     MAX_MEMORY_ENTRY_ID_LENGTH,
@@ -493,6 +494,89 @@ class OceanBaseMemoryVectorIndex:
                 )
             )
         return tuple(hydrated)
+
+
+class OceanBaseMemoryHybridIndex(CompositeMemoryIndex):
+    def __init__(self, fts: OceanBaseMemoryFTSIndex, vector: OceanBaseMemoryVectorIndex) -> None:
+        super().__init__(fts, vector)
+        self._vector = vector
+
+    @override
+    async def search(
+        self, connection: AsyncConnection, scope_id: str, request: MemorySearchRequest, /
+    ) -> MemorySearchChannels:
+        if request.mode != "hybrid":
+            return await super().search(connection, scope_id, request)
+        if request.query_vector is None or request.embedding_profile != self._vector.profile:
+            raise CapabilityNotSupportedError("embedding-profile")
+        if not await self._vector.vector_complete(connection, scope_id, request.memories, self._vector.profile):
+            raise CapabilityNotSupportedError("vector")
+        tag_fts = "" if request.tag_filter is None else memory_tag_sql("f")
+        tag_vector = "" if request.tag_filter is None else memory_tag_sql("m")
+        statement = text(
+            """
+WITH lexical AS (
+    SELECT f.memory_artifact_id, f.head_revision, f.entry_id, f.entry_version_id,
+           MATCH(f.searchable_text) AGAINST (:query) AS relevance
+    FROM pc_memory_entry_heads AS f
+    WHERE f.scope_id = :scope_id AND f.memory_artifact_id IN :memory_artifact_ids
+      AND MATCH(f.searchable_text) AGAINST (:query)
+      LEXICAL_TAG_FILTER
+    ORDER BY relevance DESC, f.memory_artifact_id, f.entry_id, f.entry_version_id
+    LIMIT :candidate_limit
+), semantic AS (
+    SELECT m.memory_artifact_id, m.head_revision, m.entry_id, m.entry_version_id,
+           l2_distance(m.embedding, :query_vector) AS distance
+    FROM pc_memory_vector_entries AS m
+    WHERE m.scope_id = :scope_id AND m.memory_artifact_id IN :memory_artifact_ids
+      VECTOR_TAG_FILTER
+    ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
+    LIMIT :candidate_limit
+), candidates AS (
+    SELECT 'fts' AS channel, memory_artifact_id, head_revision, entry_id, entry_version_id,
+           NULL AS distance,
+           ROW_NUMBER() OVER (ORDER BY relevance DESC, memory_artifact_id, entry_id, entry_version_id) AS channel_rank
+    FROM lexical
+    UNION ALL
+    SELECT 'vector' AS channel, memory_artifact_id, head_revision, entry_id, entry_version_id,
+           distance,
+           ROW_NUMBER() OVER (ORDER BY distance, memory_artifact_id, entry_id, entry_version_id) AS channel_rank
+    FROM semantic
+)
+SELECT c.*, v.text FROM candidates AS c
+JOIN pc_memory_entry_versions AS v ON v.scope_id = :scope_id
+ AND v.memory_artifact_id = c.memory_artifact_id AND v.entry_version_id = c.entry_version_id
+ORDER BY c.channel, c.channel_rank
+""".replace("LEXICAL_TAG_FILTER", tag_fts).replace("VECTOR_TAG_FILTER", tag_vector)
+        ).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("query_vector", type_=VECTOR(self._vector.profile.dimension)),
+        )
+        if request.tag_filter is not None:
+            statement = statement.bindparams(
+                bindparam("tag_keys", expanding=True), bindparam("tag_hashes", expanding=True)
+            )
+        rows = tuple(
+            (
+                await connection.execute(
+                    statement,
+                    {
+                        "scope_id": scope_id,
+                        "query": request.analyzed_query,
+                        "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
+                        "query_vector": validate_embedding(
+                            request.query_vector, dimension=self._vector.profile.dimension
+                        ),
+                        "candidate_limit": request.candidate_limit,
+                        **memory_tag_parameters(request.tag_filter),
+                    },
+                )
+            ).mappings()
+        )
+        return MemorySearchChannels(
+            fts=memory_channel_hits((row for row in rows if row["channel"] == "fts"), request.memories),
+            vector=memory_channel_hits((row for row in rows if row["channel"] == "vector"), request.memories),
+        )
 
 
 def _embedding_hash(profile: EmbeddingProfile, entry_hash: str) -> str:
