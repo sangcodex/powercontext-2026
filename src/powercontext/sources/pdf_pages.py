@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
 import math
 import re
-from collections import Counter, defaultdict
+from collections import Counter
+from copy import copy
 
 from pydantic import BaseModel, Field, field_validator
 from pypdf import PageObject, PdfReader
 from pypdf.errors import PyPdfError
-from pypdf.generic import ArrayObject, DictionaryObject, NullObject, StreamObject
+from pypdf.generic import (
+    ArrayObject,
+    ContentStream,
+    DictionaryObject,
+    NameObject,
+    NullObject,
+    StreamObject,
+    TextStringObject,
+    create_string_object,
+)
 
 from powercontext.builtin.artifacts.memory import MemoryCitation, MemoryHit
 from powercontext.builtin.runtime.application import ScopedMemoryApplication
@@ -56,7 +67,64 @@ def _page_text(page: PageObject) -> str:
         if any(not isinstance(stream.get_object(), (StreamObject, NullObject)) for stream in streams):
             detail = "PDF page contents must contain only streams"
             raise _PDFError(detail)
-    return page.extract_text() or ""
+    return _with_actual_text(page).extract_text() or ""
+
+
+def _actual_text(value: object, properties: object) -> str | None:
+    if isinstance(value, NameObject) and isinstance(properties, DictionaryObject):
+        value = properties.get(value)
+        if value is not None:
+            value = value.get_object()
+    actual = value.get("/ActualText") if isinstance(value, DictionaryObject) else None
+    if isinstance(actual, bytes):
+        actual = create_string_object(actual)
+    if actual is not None and not isinstance(actual, str):
+        detail = "PDF ActualText must be a text string"
+        raise _PDFError(detail)
+    return actual
+
+
+def _replace_text_operands(operands: list[object], operator: bytes, replacement: str) -> list[object]:
+    text = TextStringObject(replacement)
+    if operator == b"TJ":
+        return [ArrayObject([text])]
+    if operator == b'"':
+        return [*operands[:2], text]
+    return [text]
+
+
+def _with_actual_text(page: PageObject) -> PageObject:
+    contents = page.get("/Contents")
+    if contents is None or isinstance(contents.get_object(), NullObject):
+        return page
+    stream = ContentStream(contents, page.pdf, forced_encoding="bytes")
+    resources = page.get_inherited("/Resources")
+    properties = resources.get("/Properties") if isinstance(resources, DictionaryObject) else None
+    if properties is not None:
+        properties = properties.get_object()
+    spans: list[str | None] = []
+    operations = []
+    changed = False
+    for operands, operator in stream.operations:
+        if operator == b"BDC":
+            spans.append(_actual_text(operands[1], properties))
+        elif operator == b"BMC":
+            spans.append(None)
+        elif operator == b"EMC" and spans:
+            spans.pop()
+        elif operator in (b"Tj", b"TJ", b"'", b'"'):
+            index = next((index for index, value in enumerate(spans) if value is not None), None)
+            if index is not None:
+                operands = _replace_text_operands(operands, operator, spans[index] or "")
+                spans[index] = ""
+                changed = True
+        operations.append((operands, operator))
+    if not changed:
+        return page
+    stream.operations = operations
+    result = copy(page)
+    result[NameObject("/Contents")] = stream
+    return result
 
 
 def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
@@ -204,66 +272,200 @@ async def search_pdf_pages(
     terms = list(
         dict.fromkeys(token for token in tokens if token not in stopwords and (len(token) > 1 or token.isdigit()))
     )
-    queries = [question, " ".join(terms), *terms]
-    scores: dict[tuple[str, int, str, str], float] = defaultdict(float)
-    hits: dict[tuple[str, int, str, str], MemoryHit] = {}
-    term_ranks: dict[str, dict[tuple[str, int, str, str], int]] = {}
-    for query in dict.fromkeys(queries):
-        if not query:
-            continue
-        page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=min(100, max(40, limit * 3))))
-        for rank, hit in enumerate(page.hits, start=1):
-            key = (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry_id, hit.entry_version_id)
-            scores[key] += 1 / (30 + rank)
-            hits[key] = hit
-            if query in terms:
-                term_ranks.setdefault(query, {})[key] = rank
-    if not hits:
+    if not terms:
         return ()
-    ordered = _rank_pages(hits, scores, term_ranks, terms, limit)
-    return tuple(
-        MemoryCitation(
-            memory_ref=hits[key].memory_ref, entry_id=hits[key].entry_id, entry_version_id=hits[key].entry_version_id
+    search = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=max(40, limit * 3)))
+    snapshot = await memory.list()
+    if snapshot.memory_ref is None:
+        return ()
+    identities: dict[str, tuple[str, ...]] = {}
+    documents: dict[str, str] = {}
+    for record in snapshot.entries:
+        page_sources = tuple(
+            sorted(source.source_id for source in record.entry.sources if source.source_type == "pdf-page")
         )
-        for key in ordered
+        identities[record.entry.entry_id] = page_sources or (record.entry.entry_id,)
+        if page_sources:
+            documents[record.entry.entry_id] = record.entry.text.partition("\n")[0]
+    hits = tuple(
+        MemoryHit(
+            memory_ref=record.memory_ref,
+            entry_id=record.entry.entry_id,
+            entry_version_id=record.entry.entry_version_id,
+            text=record.entry.text,
+            score=0.0,
+            matched_by=("fts",),
+        )
+        for record in snapshot.entries
     )
+    priors = {hit.entry_id: 1 / (30 + rank) for rank, hit in enumerate(search.hits, start=1)}
+    preferred = _matching_documents(question, set(documents.values()))
+    if preferred:
+        hits = tuple(hit for hit in hits if documents.get(hit.entry_id) in preferred)
+    elif documents:
+        hits = tuple(hit for hit in hits if hit.entry_id in documents)
+    return await asyncio.to_thread(_rank_pages, hits, terms, priors, identities, limit)
+
+
+def _matching_documents(question: str, documents: set[str]) -> set[str]:
+    query = re.sub(r"[^a-z0-9]", "", question.lower())
+    query_words = set(re.findall(r"[a-z0-9]+", question.lower()))
+    matches = set()
+    for document in documents:
+        name = re.split(r"[_\s](?:19|20)\d{2}", document.lower(), maxsplit=1)[0]
+        name = re.sub(r"[^a-z0-9]", "", name)
+        if (len(name) > 2 and name in query) or (len(name) > 1 and name in query_words):
+            matches.add(document)
+    return matches
+
+
+def _words(text: str) -> list[str]:
+    words = []
+    for word in re.findall(r"[a-z]+|\d+", text.lower()):
+        if word.startswith("cashflow"):
+            words.extend(("cash", "flow"))
+            continue
+        if len(word) > 4 and word.endswith("ies"):
+            word = word[:-3] + "y"
+        elif len(word) > 4 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        words.append(word)
+    return words
+
+
+def _query_topics(terms: set[str]) -> tuple[tuple[str, ...], ...]:
+    topics = []
+    if terms & {
+        "ratio",
+        "liquidity",
+        "asset",
+        "debt",
+        "capital",
+        "cash",
+        "margin",
+        "ebitda",
+        "capex",
+        "income",
+        "profit",
+    }:
+        topics.extend([
+            (
+                "consolidated statements of income",
+                "consolidated statements of operations",
+                "consolidated statements of earnings",
+            ),
+            ("consolidated balance sheet", "consolidated statements of financial position"),
+            ("consolidated statements of cash flows", "consolidated statement of cash flows"),
+        ])
+    if terms & {"legal", "litigation", "lawsuit", "battle"}:
+        topics.append(("legal proceedings", "litigation", "contingencies"))
+    if terms & {"geography", "geographic", "geographical", "region", "country"}:
+        topics.extend([
+            ("geographic", "geographical", "international", "business segments", "segment information"),
+            ("item 1 business", "our business", "business overview"),
+        ])
+    if terms & {"product", "service", "customer", "segment", "category"}:
+        topics.append(("business", "products", "customers", "segments", "segment information"))
+    if terms & {"revenue", "sale", "margin", "tax", "change"}:
+        topics.append((
+            "results of operations",
+            "consolidated statements of income",
+            "consolidated statements of operations",
+        ))
+    if "tax" in terms:
+        topics.append(("income taxes", "effective tax rate", "provision for income taxes"))
+    if terms & {"category", "segment"} and terms & {"revenue", "sale", "growth"}:
+        topics.append(("business segment data", "segment results", "segment information", "segment performance"))
+    if terms & {"cyclicality", "cyclical"}:
+        topics.append(("business", "industry", "demand", "cyclical", "cyclicality"))
+    return tuple(topics)
+
+
+def _topic_score(text: str, phrases: tuple[str, ...]) -> float:
+    normalized = " " + " ".join(_words(text)) + " "
+    headings = [" " + " ".join(_words(line)) + " " for line in text.splitlines() if 1 <= len(_words(line)) <= 14]
+    values = []
+    for phrase in phrases:
+        normalized_phrase = " " + " ".join(_words(phrase)) + " "
+        if normalized_phrase in normalized:
+            heading = max(
+                (len(normalized_phrase) / len(line) for line in headings if normalized_phrase in line),
+                default=0.0,
+            )
+            values.append(1 + 4 * heading)
+    return max(values, default=0.0)
 
 
 def _rank_pages(
-    hits: dict[tuple[str, int, str, str], MemoryHit],
-    scores: dict[tuple[str, int, str, str], float],
-    term_ranks: dict[str, dict[tuple[str, int, str, str], int]],
+    hits: tuple[MemoryHit, ...],
     terms: list[str],
+    priors: dict[str, float],
+    identities: dict[str, tuple[str, ...]],
     limit: int,
-) -> list[tuple[str, int, str, str]]:
-    counts = {key: Counter(re.findall(r"[a-z]+|\d+", hit.text.lower())) for key, hit in hits.items()}
-    frequencies = Counter(term for count in counts.values() for term in count)
-    average_length = sum(sum(count.values()) for count in counts.values()) / len(counts)
-    relevance = {}
-    for key, count in counts.items():
+) -> tuple[MemoryCitation, ...]:
+    documents = [hit.text.partition("\n")[2] or hit.text for hit in hits]
+    counts = [Counter(_words(text)) for text in documents]
+    frequencies = Counter(term for count in counts for term in count)
+    query = set(_words(" ".join(terms)))
+    topics = _query_topics(query)
+    weights = {term: math.log1p((len(hits) - frequencies[term] + 0.5) / (frequencies[term] + 0.5)) for term in query}
+    average_length = sum(sum(count.values()) for count in counts) / max(len(counts), 1)
+    scores = []
+    topic_scores: list[list[float]] = [[] for _ in topics]
+    for hit, count, text in zip(hits, counts, documents, strict=True):
         length_factor = 1.2 * (0.25 + 0.75 * sum(count.values()) / max(average_length, 1))
-        relevance[key] = sum(
-            math.log1p((len(counts) - frequencies[term] + 0.5) / (frequencies[term] + 0.5))
-            * count[term]
-            * 2.2
-            / (count[term] + length_factor)
-            for term in terms
-            if count[term]
+        score = sum(weights[term] * count[term] * 2.2 / (count[term] + length_factor) for term in query if count[term])
+        words = _words(text)
+        passage = max(
+            (
+                sum(weights[term] for term in set(words[start : start + 80]) & query)
+                for start in range(0, len(words), 40)
+            ),
+            default=0.0,
         )
-    ordered: list[tuple[str, int, str, str]] = []
-    coverage = dict.fromkeys(terms, 0.0)
-    remaining = set(hits)
-    maximum = max(relevance.values(), default=1.0) or 1.0
-    while remaining and len(ordered) < limit:
-        marginal = {
-            key: relevance[key] / maximum
-            + sum((1 - coverage[term]) / ranks[key] for term, ranks in term_ranks.items() if key in ranks)
-            for key in remaining
-        }
-        chosen = min(remaining, key=lambda key: (-marginal[key], -scores[key], key))
-        remaining.remove(chosen)
-        ordered.append(chosen)
-        for term, ranks in term_ranks.items():
-            if chosen in ranks:
-                coverage[term] += (1 - coverage[term]) / ranks[chosen]
-    return ordered
+        if score:
+            scores.append((score + passage, priors.get(hit.entry_id, 0.0), hit))
+        for values, phrases in zip(topic_scores, topics, strict=True):
+            values.append(_topic_score(text, phrases))
+    scores.sort(key=lambda item: (-item[0], -item[1], item[2].entry_id, item[2].entry_version_id))
+    selected = _select_pages(hits, scores, topic_scores, priors, identities, limit)
+    return tuple(
+        MemoryCitation(memory_ref=hit.memory_ref, entry_id=hit.entry_id, entry_version_id=hit.entry_version_id)
+        for hit in selected
+    )
+
+
+def _select_pages(
+    hits: tuple[MemoryHit, ...],
+    scores: list[tuple[float, float, MemoryHit]],
+    topic_scores: list[list[float]],
+    priors: dict[str, float],
+    identities: dict[str, tuple[str, ...]],
+    limit: int,
+) -> list[MemoryHit]:
+    selected: list[MemoryHit] = []
+    selected_pages: set[tuple[str, ...]] = set()
+    for _, _, hit in scores:
+        if identities[hit.entry_id] not in selected_pages and len(selected) < max(1, limit // 3):
+            selected.append(hit)
+            selected_pages.add(identities[hit.entry_id])
+    rankings = [
+        sorted(
+            range(len(hits)),
+            key=lambda index: (-values[index], -priors.get(hits[index].entry_id, 0.0), hits[index].entry_id),
+        )
+        for values in topic_scores
+    ]
+    for rank in range(len(hits)):
+        for values, ordering in zip(topic_scores, rankings, strict=True):
+            index = ordering[rank]
+            if values[index] and identities[hits[index].entry_id] not in selected_pages and len(selected) < limit:
+                selected.append(hits[index])
+                selected_pages.add(identities[hits[index].entry_id])
+        if len(selected) == limit:
+            break
+    for _, _, hit in scores:
+        if identities[hit.entry_id] not in selected_pages and len(selected) < limit:
+            selected.append(hit)
+            selected_pages.add(identities[hit.entry_id])
+    return selected
